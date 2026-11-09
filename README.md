@@ -1,4 +1,4 @@
-# Bàn hương án – Gaussian splat AR
+# Bàn – Gaussian splat AR
 
 Static web page (PlayCanvas engine 2.23.3, WebXR) that shows `huonganleak.sog` and lets you place it on the floor in AR.
 
