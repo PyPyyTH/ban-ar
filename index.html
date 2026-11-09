@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Bàn Hương Án AR</title>
+<style>
+  :root { --bg:#eceae6; --fg:#1d1d1f; --muted:#6b6b70; --accent:#b4532a; --panel:rgba(255,255,255,.88); }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; background:var(--bg); color:var(--fg);
+    font:15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; touch-action:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #ui { position:fixed; inset:0; pointer-events:none; }
+  #ui > * { pointer-events:auto; }
+  .top { position:absolute; top:12px; left:16px; right:16px; display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+  .card { background:var(--panel); border-radius:12px; padding:8px 12px; backdrop-filter:blur(8px); box-shadow:0 1px 4px rgba(0,0,0,.12); }
+  h1 { font-size:16px; margin:0; }
+  .credit { font-size:12px; color:var(--muted); }
+  .credit a { color:inherit; }
+  .bottom { position:absolute; left:16px; right:16px; bottom:max(16px, env(safe-area-inset-bottom)); display:flex; flex-direction:column; align-items:center; gap:10px; }
+  button { font:inherit; border:0; border-radius:999px; padding:12px 20px; background:var(--panel); color:var(--fg); box-shadow:0 1px 4px rgba(0,0,0,.15); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; font-weight:600; font-size:16px; padding:14px 28px; }
+  button:disabled { opacity:.5; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; align-items:center; }
+  #hint { text-align:center; max-width:420px; }
+  #scaleWrap { display:flex; align-items:center; gap:8px; }
+  #scale { width:160px; }
+  #progress { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); }
+  .ar-only { display:none; }
+  body.in-ar .ar-only { display:flex; }
+  body.in-ar .no-ar { display:none !important; }
+  body.in-ar { background:transparent; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="ui">
+  <div class="top no-ar">
+    <div class="card">
+      <h1>Bàn hương án</h1>
+      <div class="credit">Splat: <a href="https://superspl.at/scene/a3864123" target="_blank" rel="noopener">jsc</a> · CC BY 4.0</div>
+    </div>
+  </div>
+
+  <div id="progress" class="card">Đang tải mô hình… <span id="pct">0%</span></div>
+
+  <div class="bottom">
+    <div id="hint" class="card" style="display:none"></div>
+
+    <div class="row ar-only">
+      <button id="rotL">⟲ 15°</button>
+      <div id="scaleWrap" class="card">
+        <span>Cỡ</span><input id="scale" type="range" min="10" max="200" value="100" step="5"><span id="scaleVal">100%</span>
+      </div>
+      <button id="rotR">15° ⟳</button>
+    </div>
+    <div class="row ar-only">
+      <button id="exitAr">Thoát AR</button>
+    </div>
+
+    <div class="row no-ar">
+      <button id="enterAr" class="primary" disabled>Xem bằng AR</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as pc from './lib/playcanvas.min.mjs';
+
+// ---- Model tuning -------------------------------------------------------
+// Splat files are usually authored Y-down; rotate 180° around X so the table stands upright.
+const MODEL_EULER = [180, 0, 0];
+// Offset (in model units, after rotation) that moves the table's footprint centre onto the pivot.
+const MODEL_OFFSET = [-0.09, -0.28, -0.09];
+// Scale at 100% on the slider: the table is ~2.52 units tall in the file -> ~1.26 m in AR.
+const BASE_SCALE = 0.5;
+// -------------------------------------------------------------------------
+
+const canvas = document.getElementById('c');
+const app = new pc.Application(canvas, {
+  mouse: new pc.Mouse(canvas),
+  touch: new pc.TouchDevice(canvas),
+  graphicsDeviceOptions: { antialias: false, alpha: true }
+});
+app.setCanvasFillMode(pc.FILLMODE_FILL_WINDOW);
+app.setCanvasResolution(pc.RESOLUTION_AUTO);
+window.addEventListener('resize', () => app.resizeCanvas());
+
+const ui = {
+  body: document.body,
+  enter: document.getElementById('enterAr'),
+  exit: document.getElementById('exitAr'),
+  hint: document.getElementById('hint'),
+  progress: document.getElementById('progress'),
+  pct: document.getElementById('pct'),
+  scale: document.getElementById('scale'),
+  scaleVal: document.getElementById('scaleVal'),
+  rotL: document.getElementById('rotL'),
+  rotR: document.getElementById('rotR')
+};
+const showHint = (t) => { ui.hint.style.display = t ? '' : 'none'; ui.hint.textContent = t || ''; };
+
+// Camera
+const BG = new pc.Color(0.925, 0.918, 0.902, 1);
+const camera = new pc.Entity('camera');
+camera.addComponent('camera', { clearColor: BG, nearClip: 0.01, farClip: 100 });
+app.root.addChild(camera);
+
+// Model: pivot (placed in the world) -> splat (oriented + offset)
+const pivot = new pc.Entity('pivot');
+app.root.addChild(pivot);
+const splat = new pc.Entity('splat');
+splat.setLocalEulerAngles(...MODEL_EULER);
+splat.setLocalPosition(...MODEL_OFFSET);
+pivot.addChild(splat);
+
+let userScale = 1;
+let userYaw = 0;
+const applyPivotTransform = () => {
+  const s = BASE_SCALE * userScale;
+  pivot.setLocalScale(s, s, s);
+  pivot.setLocalEulerAngles(0, userYaw, 0);
+};
+applyPivotTransform();
+
+// Load the .sog bundle
+const asset = new pc.Asset('ban', 'gsplat', { url: './huonganleak.sog' });
+asset.on('progress', (received, length) => {
+  if (length) ui.pct.textContent = Math.round(100 * received / length) + '%';
+});
+asset.on('load', () => {
+  splat.addComponent('gsplat', { asset });
+  ui.progress.style.display = 'none';
+  updateArButton();
+});
+asset.on('error', (err) => { ui.progress.textContent = 'Lỗi tải mô hình: ' + err; });
+app.assets.add(asset);
+app.assets.load(asset);
+
+app.start();
+
+// ---- Orbit controls (non-AR) -------------------------------------------
+const orbit = { yaw: 35, pitch: -15, dist: 4.8, target: new pc.Vec3(0, 0.5, 0) };
+const updateOrbitCamera = () => {
+  const q = new pc.Quat().setFromEulerAngles(orbit.pitch, orbit.yaw, 0);
+  const off = q.transformVector(new pc.Vec3(0, 0, orbit.dist));
+  camera.setPosition(orbit.target.x + off.x, orbit.target.y + off.y, orbit.target.z + off.z);
+  camera.setRotation(q);
+};
+updateOrbitCamera();
+
+const pointers = new Map();
+let pinchStart = 0, distStart = 0;
+canvas.addEventListener('pointerdown', (e) => { canvas.setPointerCapture(e.pointerId); pointers.set(e.pointerId, { x: e.clientX, y: e.clientY }); });
+canvas.addEventListener('pointerup', (e) => { pointers.delete(e.pointerId); pinchStart = 0; });
+canvas.addEventListener('pointercancel', (e) => { pointers.delete(e.pointerId); pinchStart = 0; });
+canvas.addEventListener('pointermove', (e) => {
+  if (app.xr.active || !pointers.has(e.pointerId)) return;
+  const p = pointers.get(e.pointerId);
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX; p.y = e.clientY;
+  if (pointers.size === 1) {
+    orbit.yaw -= dx * 0.3;
+    orbit.pitch = pc.math.clamp(orbit.pitch - dy * 0.3, -89, 89);
+  } else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (!pinchStart) { pinchStart = d; distStart = orbit.dist; }
+    orbit.dist = pc.math.clamp(distStart * pinchStart / d, 0.3, 20);
+  }
+  updateOrbitCamera();
+});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  orbit.dist = pc.math.clamp(orbit.dist * (1 + e.deltaY * 0.001), 0.3, 20);
+  updateOrbitCamera();
+}, { passive: false });
+
+// ---- AR -----------------------------------------------------------------
+// Reticle: flat ring that follows the hit-test result on the floor
+const reticleMat = new pc.StandardMaterial();
+reticleMat.diffuse = new pc.Color(0, 0, 0);
+reticleMat.emissive = new pc.Color(1, 1, 1);
+reticleMat.useLighting = false;
+reticleMat.update();
+const reticle = new pc.Entity('reticle');
+reticle.addComponent('render', { type: 'torus', material: reticleMat, castShadows: false });
+reticle.setLocalScale(0.25, 0.01, 0.25);
+reticle.enabled = false;
+app.root.addChild(reticle);
+
+let placed = false;
+let hitTestSource = null;
+
+function updateArButton() {
+  const ok = app.xr.supported && app.xr.isAvailable(pc.XRTYPE_AR);
+  ui.enter.disabled = !ok || !asset.loaded;
+  ui.enter.textContent = ok ? 'Xem bằng AR' : (window.isSecureContext ? 'Thiết bị không hỗ trợ WebXR AR' : 'Cần mở qua HTTPS để dùng AR');
+}
+app.xr.on('available:' + pc.XRTYPE_AR, updateArButton);
+updateArButton();
+
+// The overlay stays visible inside the AR session (Android Chrome)
+app.xr.domOverlay.root = document.getElementById('ui');
+// Taps on UI controls must not count as "place model" taps
+for (const el of document.querySelectorAll('#ui button, #ui input, .card')) {
+  el.addEventListener('beforexrselect', (e) => e.preventDefault());
+}
+
+ui.enter.addEventListener('click', () => {
+  camera.camera.startXr(pc.XRTYPE_AR, pc.XRSPACE_LOCALFLOOR, {
+    callback: (err) => { if (err) alert('Không mở được AR: ' + err.message); }
+  });
+});
+ui.exit.addEventListener('click', () => app.xr.end());
+
+app.xr.on('start', () => {
+  ui.body.classList.add('in-ar');
+  camera.camera.clearColor = new pc.Color(0, 0, 0, 0);
+  placed = false;
+  pivot.enabled = false;
+  showHint('Lia điện thoại chậm qua mặt sàn để tìm vị trí…');
+  app.xr.hitTest.start({
+    entityTypes: [pc.XRTRACKABLE_PLANE, pc.XRTRACKABLE_POINT],
+    callback: (err, source) => {
+      if (err) { showHint('Không bật được dò mặt phẳng: ' + err.message); return; }
+      hitTestSource = source;
+      source.on('result', (position, rotation) => {
+        reticle.enabled = true;
+        reticle.setPosition(position);
+        if (!placed) showHint('Chạm vào màn hình để đặt bàn');
+      });
+    }
+  });
+});
+
+app.xr.on('end', () => {
+  ui.body.classList.remove('in-ar');
+  camera.camera.clearColor = BG;
+  reticle.enabled = false;
+  if (hitTestSource) { hitTestSource.remove(); hitTestSource = null; }
+  pivot.enabled = true;
+  pivot.setPosition(0, 0, 0);
+  showHint('');
+  updateOrbitCamera();
+});
+
+app.xr.input.on('select', () => {
+  if (!reticle.enabled) return;
+  pivot.setPosition(reticle.getPosition());
+  // Face the table towards the viewer on first placement
+  if (!placed) {
+    const cam = camera.getPosition(), p = reticle.getPosition();
+    userYaw = Math.atan2(cam.x - p.x, cam.z - p.z) * pc.math.RAD_TO_DEG;
+    applyPivotTransform();
+  }
+  pivot.enabled = true;
+  placed = true;
+  showHint('Chạm chỗ khác để dời bàn · dùng nút để xoay / đổi cỡ');
+});
+
+ui.scale.addEventListener('input', () => {
+  userScale = ui.scale.value / 100;
+  ui.scaleVal.textContent = ui.scale.value + '%';
+  applyPivotTransform();
+});
+ui.rotL.addEventListener('click', () => { userYaw += 15; applyPivotTransform(); });
+ui.rotR.addEventListener('click', () => { userYaw -= 15; applyPivotTransform(); });
+
+// Expose for tuning from the console
+window.__ar = { app, pc, pivot, splat, camera, orbit, updateOrbitCamera };
+</script>
+</body>
+</html>
